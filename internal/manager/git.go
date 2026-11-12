@@ -55,45 +55,64 @@ func (s snapshot) validate() error {
 
 func discover(ctx context.Context, git gitRunner, upstream string) (snapshot, error) {
 	out, err := git(ctx, "", "ls-remote", "--symref", "--", upstream, "HEAD", "refs/heads/*", "refs/tags/*")
-	s := snapshot{refs: make(map[string]string)}
 	if err != nil {
-		return s, fmt.Errorf("查询上游引用：%w", err)
+		return snapshot{}, fmt.Errorf("查询上游引用：%w", err)
 	}
+	s := snapshot{refs: make(map[string]string)}
+	head := ""
 	for line := range strings.SplitSeq(out, "\n") {
 		oid, ref, ok := strings.Cut(line, "\t")
 		if !ok {
 			continue
 		}
-		switch {
-		case ref == "HEAD" && strings.HasPrefix(oid, "ref: "+gitHeads):
-			s.branch = strings.TrimPrefix(oid, "ref: "+gitHeads)
-		case strings.HasPrefix(ref, gitHeads), strings.HasPrefix(ref, gitTags) && !strings.HasSuffix(ref, "^{}"):
-			if err := s.add(ref, oid); err != nil {
-				return s, err
+		if ref == "HEAD" {
+			if branch, ok := strings.CutPrefix(oid, "ref: "+gitHeads); ok {
+				s.branch = branch
+			} else {
+				head = oid
 			}
+		} else if err := addAdvertisedRef(&s, ref, oid); err != nil {
+			return s, err
 		}
 	}
+	return finishDiscovery(s, head)
+}
+
+func addAdvertisedRef(s *snapshot, ref, oid string) error {
+	if strings.HasPrefix(ref, gitHeads) || (strings.HasPrefix(ref, gitTags) && !strings.HasSuffix(ref, "^{}")) {
+		return s.add(ref, oid)
+	}
+	return nil
+}
+
+func finishDiscovery(s snapshot, head string) (snapshot, error) {
 	if s.branch == "" {
-		// 上游 HEAD 不可用时，在已有分支中选一个确定的工作树入口。
-		s.branch = firstBranch(s.refs)
+		// 上游未通告 HEAD 指向时，优先从同一提交上的分支选择确定的入口。
+		first := ""
+		for ref, oid := range s.refs {
+			name, ok := strings.CutPrefix(ref, gitHeads)
+			if !ok {
+				continue
+			}
+			if first == "" || name < first {
+				first = name
+			}
+			if oid == head && (s.branch == "" || name < s.branch) {
+				s.branch = name
+			}
+		}
+		if s.branch == "" {
+			s.branch = first
+		}
 	}
 	return s, s.validate()
 }
 
-func firstBranch(refs map[string]string) string {
-	first := ""
-	for ref := range refs {
-		if name, ok := strings.CutPrefix(ref, gitHeads); ok && (first == "" || name < first) {
-			first = name
-		}
-	}
-	return first
-}
-
 func fetchSnapshot(ctx context.Context, git gitRunner, dir, upstream, branch string) (snapshot, error) {
 	// fetch 只写暂存引用。先完成 prune，Git 才能用 foo/bar 替换原有的 foo。
+	// 仓库 URL 已校验为 HTTP(S)，直接作为位置参数兼容旧版 Git。
 	_, err := git(ctx, dir, "fetch", "--prune", "--no-tags", "--no-recurse-submodules",
-		"--no-write-fetch-head", "--", upstream, "+"+gitHeads+"*:"+syncedHeads+"*", "+"+gitTags+"*:"+syncedTags+"*")
+		upstream, "+"+gitHeads+"*:"+syncedHeads+"*", "+"+gitTags+"*:"+syncedTags+"*")
 	if err != nil {
 		return snapshot{}, fmt.Errorf("拉取上游分支和标签：%w", err)
 	}

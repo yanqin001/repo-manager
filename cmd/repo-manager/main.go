@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yanqin001/repo-manger/internal/manager"
+	"github.com/yanqin001/repo-manager/internal/manager"
 )
 
 func main() {

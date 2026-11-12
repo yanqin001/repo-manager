@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yanqin001/repo-manger/sdk"
+	"github.com/yanqin001/repo-manager/sdk"
 )
 
 // transportFunc 让 SDK 和身份查询走可控的内存 HTTP 链路。

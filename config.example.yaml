@@ -1,0 +1,23 @@
+# 复制到 config/config.yaml 后填写部署值。
+local_repo_path: "/source"
+listen_addr: "127.0.0.1:8080"
+job_timeout: "6h"
+
+direct:
+  proxy: "http://proxy.example.com:8080"
+  max_concurrency: 2
+  proxy_timeout: "1h"
+
+rayfile:
+  local_cmd_path: "/usr/local/bin/rayfile-c_cmd"
+  remote_cmd_path: "/data/sync-cmd-linux/rayfile-c_cmd"
+  server_path: "/data/code"
+  host: "rayfile.example.com"
+  port: 32001
+  user: "REPLACE_ME"
+  password: "REPLACE_ME"
+  max_concurrency: 1
+
+remote:
+  host: "root@git-relay.example.com"
+  repo_path: "/data/code"

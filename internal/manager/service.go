@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yanqin001/repo-manger/sdk"
+	"github.com/yanqin001/repo-manager/sdk"
 )
 
 const (
@@ -64,7 +64,7 @@ func New(cfg Config) (*Service, error) {
 	remoteLimit := min(maxPending, cfg.Rayfile.MaxConcurrency)
 	return &Service{
 		cfg: cfg, registry: reg, identity: newIdentityResolver(cfg),
-		relay: relay{cfg: cfg, remote: sshCommand(cfg.Remote.Host), download: localCommand},
+		relay: relay{cfg: cfg, download: localCommand},
 		ctx:   ctx, cancel: cancel,
 		direct: make(chan struct{}, directLimit), remote: make(chan struct{}, remoteLimit),
 		workers: make(chan struct{}, min(maxPending, directLimit+remoteLimit)),

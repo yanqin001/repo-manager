@@ -20,6 +20,7 @@ type relay struct {
 	cfg      Config
 	remote   inputRunner
 	download commandRunner
+	legacy   bool // Git 2.29 之前的远端使用 SHA-1 和旧版兼容命令。
 }
 
 func (r relay) command(ctx context.Context, program string, args ...string) (string, error) {
@@ -31,9 +32,33 @@ func (r relay) git(ctx context.Context, dir string, args ...string) (string, err
 }
 
 func (r relay) synchronize(ctx context.Context, repo repository, rec repoRecord, rel, id string, local localRepo) (snapshot, error) {
-	advertised, err := discover(ctx, r.git, repo.cloneURL)
+	if r.remote == nil {
+		run, close, err := openSSHRunner(r.cfg.Remote.Host)
+		if err != nil {
+			return snapshot{}, fmt.Errorf("准备 SSH 连接：%w", err)
+		}
+		defer close()
+		r.remote = run
+	}
+	version, err := r.git(ctx, "", "--version")
+	if err != nil {
+		return snapshot{}, fmt.Errorf("查询远端 Git 版本：%w", err)
+	}
+	r.legacy, err = legacyGitVersion(version)
 	if err != nil {
 		return snapshot{}, err
+	}
+	var advertised snapshot
+	if r.legacy {
+		advertised, err = r.discoverLegacy(ctx, repo.cloneURL)
+	} else {
+		advertised, err = discover(ctx, r.git, repo.cloneURL)
+	}
+	if err != nil {
+		return snapshot{}, err
+	}
+	if r.legacy && advertised.oidSize == 64 {
+		return snapshot{}, fmt.Errorf("远端 Git 需要升级到 2.29 或更高版本才能同步 SHA-256 仓库")
 	}
 	cache, err := r.prepareRemote(ctx, repo, rec, rel, advertised.oidSize)
 	if err != nil {
@@ -75,8 +100,12 @@ func (r relay) prepareRemote(ctx context.Context, repo repository, rec repoRecor
 		// 远端可能已有旧工作树，只有 origin 已知且对象格式匹配时才复用。
 		origin, originErr := gitOrigin(ctx, r.git, candidate)
 		if originErr == nil && slices.Contains(rec.Origins, origin.key) {
-			actual, err := r.git(ctx, candidate, "rev-parse", "--show-object-format")
-			if err == nil && strings.TrimSpace(actual) == format {
+			matchesFormat := r.legacy
+			if !r.legacy {
+				actual, err := r.git(ctx, candidate, "rev-parse", "--show-object-format")
+				matchesFormat = err == nil && strings.TrimSpace(actual) == format
+			}
+			if matchesFormat {
 				if _, err := r.git(ctx, candidate, "config", "--local", "--replace-all", "remote.origin.url", repo.cloneURL); err != nil {
 					return "", err
 				}
@@ -90,7 +119,11 @@ func (r relay) prepareRemote(ctx context.Context, repo repository, rec repoRecor
 		if present != "" {
 			continue
 		}
-		if _, err := r.git(ctx, "", "init", "--bare", "--quiet", "--object-format="+format, "--", candidate); err != nil {
+		args := []string{"init", "--bare", "--quiet"}
+		if !r.legacy {
+			args = append(args, "--object-format="+format)
+		}
+		if _, err := r.git(ctx, "", append(args, "--", candidate)...); err != nil {
 			return "", err
 		}
 		if _, err := r.git(ctx, candidate, "config", "--local", "remote.origin.url", repo.cloneURL); err != nil {
@@ -184,18 +217,8 @@ func (r relay) transfer(ctx context.Context, repo repository, cache, stage, id s
 		_, _ = r.command(cleanupCtx, "rm", "-rf", "--", remoteDir)
 	}()
 	remoteBundle := path.Join(remoteDir, filename)
-	var revisions []string
-	for ref := range target.refs {
-		revisions = append(revisions, stagedRef(ref))
-	}
-	slices.Sort(revisions)
-	for _, oid := range bases {
-		revisions = append(revisions, "^"+oid)
-	}
-	// 经 stdin 传递引用，分支较多时也不受系统参数长度限制。
 	packStarted := time.Now()
-	if _, err := remoteGit(r.remote, ctx, cache, strings.Join(revisions, "\n")+"\n",
-		"bundle", "create", remoteBundle, "--stdin"); err != nil {
+	if err := r.createBundle(ctx, cache, remoteBundle, target, bases); err != nil {
 		return true, fmt.Errorf("生成 %s bundle：%w", kind, err)
 	}
 	packDuration := time.Since(packStarted)
@@ -247,6 +270,32 @@ func (r relay) transfer(ctx context.Context, repo repository, cache, stage, id s
 	slog.Info("雷速传输完成", "task", id, "bundle", kind, "bytes", size,
 		"pack_duration", packDuration, "upload_duration", uploadDuration, "download_duration", downloadDuration)
 	return false, nil
+}
+
+func (r relay) createBundle(ctx context.Context, cache, file string, target snapshot, bases []string) error {
+	var input string
+	args := []string{"bundle", "create", file}
+	if r.legacy {
+		// Git 1.8 的 bundle 不读取 --stdin，用两个 ref glob 覆盖全部引用。
+		// 限制排除项只会增加重复传输，确保传给 SSH 的命令不会超过单个参数的长度。
+		args = append(args, "--glob="+syncedHeads+"*", "--glob="+syncedTags+"*")
+		for _, oid := range bases[:min(len(bases), 1024)] {
+			args = append(args, "^"+oid)
+		}
+	} else {
+		revisions := make([]string, 0, len(target.refs)+len(bases))
+		for ref := range target.refs {
+			revisions = append(revisions, stagedRef(ref))
+		}
+		slices.Sort(revisions)
+		for _, oid := range bases {
+			revisions = append(revisions, "^"+oid)
+		}
+		input = strings.Join(revisions, "\n") + "\n"
+		args = append(args, "--stdin")
+	}
+	_, err := remoteGit(r.remote, ctx, cache, input, args...)
+	return err
 }
 
 func (r relay) rayArgs(operation, source, destination string) []string {

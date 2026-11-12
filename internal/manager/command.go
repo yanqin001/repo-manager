@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -60,12 +62,16 @@ func gitEnvironment() []string {
 }
 
 func gitArgs(proxy string, args ...string) []string {
-	return append([]string{
+	config := []string{
 		"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
 		"-c", "protocol.https.allow=always", "-c", "protocol.http.allow=always",
-		"-c", "http.proxy=" + proxy, "-c", "http.followRedirects=initial",
-		"-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=60",
-	}, args...)
+		"-c", "http.followRedirects=initial", "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=60",
+	}
+	// Git 1.8 的 HTTP 子进程会把空的 -c http.proxy= 误读为缺少值。
+	if proxy != "" {
+		config = append(config, "-c", "http.proxy="+proxy)
+	}
+	return append(config, args...)
 }
 
 type gitRunner func(ctx context.Context, dir string, args ...string) (string, error)
@@ -80,16 +86,33 @@ func gitInput(ctx context.Context, dir, input string, args ...string) (string, e
 	return execute(ctx, dir, "git", gitArgs("", args...), gitEnvironment(), strings.NewReader(input))
 }
 
-func sshCommand(host string) inputRunner {
-	return func(ctx context.Context, input, program string, args ...string) (string, error) {
+func openSSHRunner(host string) (inputRunner, func(), error) {
+	dir, err := os.MkdirTemp("", "repo-manager-ssh-")
+	if err != nil {
+		return nil, nil, err
+	}
+	socket := filepath.Join(dir, "control")
+	// 一个回退任务共用一次 SSH 握手。独立的私有套接字避免跨任务和账号串用连接。
+	options := []string{"-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15",
+		"-o", "ControlMaster=auto", "-o", "ControlPersist=60", "-S", socket, "-T", "--", host}
+	run := func(ctx context.Context, input, program string, args ...string) (string, error) {
 		parts := append([]string{program}, args...)
 		for i := range parts {
 			parts[i] = shellQuote(parts[i])
 		}
 		// SSH 传入远端 shell 的命令只由逐项引用后的参数组成。
-		return execute(ctx, "", "ssh", []string{"-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-			"-o", "ConnectTimeout=15", "-T", "--", host, "exec " + strings.Join(parts, " ")}, nil, strings.NewReader(input))
+		command := "exec " + strings.Join(parts, " ")
+		return execute(ctx, "", "ssh", append(slices.Clone(options), command), nil, strings.NewReader(input))
 	}
+	close := func() {
+		defer os.RemoveAll(dir)
+		if _, err := os.Lstat(socket); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = localCommand(ctx, "ssh", "-S", socket, "-O", "exit", "--", host)
+		}
+	}
+	return run, close, nil
 }
 
 func shellQuote(s string) string {
@@ -97,14 +120,17 @@ func shellQuote(s string) string {
 }
 
 func remoteGit(remote inputRunner, ctx context.Context, dir, input string, args ...string) (string, error) {
-	if dir != "" {
-		args = append([]string{"-C", dir}, args...)
-	}
 	env := []string{"-u", "http_proxy", "-u", "https_proxy", "-u", "all_proxy", "-u", "HTTP_PROXY",
-		"-u", "HTTPS_PROXY", "-u", "ALL_PROXY", "-u", "GIT_DIR", "-u", "GIT_WORK_TREE",
-		"GIT_CONFIG_COUNT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
+		"-u", "HTTPS_PROXY", "-u", "ALL_PROXY", "-u", "GIT_DIR", "-u", "GIT_WORK_TREE", "-u", "GIT_CONFIG_PARAMETERS",
+		"NO_PROXY=*", "no_proxy=*", "GIT_CONFIG_COUNT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C", "git"}
-	return remote(ctx, input, "env", append(env, gitArgs("", args...)...)...)
+	env = append(env, gitArgs("", args...)...)
+	if dir == "" {
+		return remote(ctx, input, "env", env...)
+	}
+	// CentOS 7 自带的 Git 1.8 不支持 -C。通过位置参数切换目录，避免拼接 shell 表达式。
+	prefix := []string{"-c", `cd -- "$1" || exit; shift; exec env "$@"`, "repo-manager-git", dir}
+	return remote(ctx, input, "sh", append(prefix, env...)...)
 }
 
 func redactError(err error, cfg Config) string {

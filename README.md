@@ -4,6 +4,8 @@ repo-manager 把公开 Git 仓库同步到共享的 `/source/<domain_name>/<repo
 
 ## 启动
 
+首次部署时，将 `config.example.yaml` 复制为 `config/config.yaml` 并填写实际配置。部署文件包含凭据，保存在本机。
+
 ```bash
 go build -buildvcs=false -o repo-manager ./cmd/repo-manager
 ./repo-manager -config config/config.yaml
@@ -14,14 +16,20 @@ go build -buildvcs=false -o repo-manager ./cmd/repo-manager
 默认监听 `127.0.0.1:8080`。跨主机调用时，通过 `listen_addr` 配置内网监听地址，并确保调用方能读取同一份仓库目录。HTTP API 无应用层鉴权。
 
 - `direct.proxy` 用于国外仓库。国内仓库 `gitee.com` 和 `gitcode.com` 直连。`direct.max_concurrency` 限制本地 Git 并发，`direct.proxy_timeout` 默认 `1h`，任务总超时 `job_timeout` 默认 `6h`。
-- 国外仓库走代理失败时，使用 `remote.host` 经 SSH 更新 `remote.repo_path` 下的 Git 缓存。SSH 使用部署账号的密钥和 `known_hosts`，配置中省略 SSH 用户时使用 `root`。远端需要 Git、`sha256sum` 和 `rayfile.remote_cmd_path` 指定的客户端。
+- 国外仓库走代理失败时，使用 `remote.host` 经 SSH 更新 `remote.repo_path` 下的 Git 缓存。SSH 使用部署账号的密钥和 `known_hosts`，配置中省略 SSH 用户时使用 `root`。远端需要 Git、`sha256sum` 和 `rayfile.remote_cmd_path` 指定的客户端。Git 2.29 之前的远端还需要 `curl` 读取上游的 smart HTTP 引用通告，支持 SHA-1 仓库。
 - 雷速服务端按 `rayfile.server_path/<domain_name>` 分区，默认根目录为 `/data/code`。确保分区可写、可下载，例如 `/data/code/github.com`。每个任务上传独立命名的 bundle。服务校验 SHA-256 和 Git 前置对象后导入，增量校验失败时重新取全量包。传输完成后尽力清理任务文件。日志记录 bundle 类型、大小和打包、上传、下载耗时。
 - GitHub、Gitee 和 GitCode 通过平台 API 返回的 ID 确认改名和组织转移。可选的 `identity_tokens` 以域名为键配置平台 API token。身份解析失败时保留已有映射。仓库已登记过稳定 ID 或可通过请求地址、规范地址接管旧目录时，可以复用原目录。首次只提交迁移后的新地址时，未登记且无法由这些地址定位的旧目录可能无法识别。
 
 ## Go SDK
 
+发布 `v0.0.1` 后，在调用项目中安装 SDK。
+
+```bash
+go get github.com/yanqin001/repo-manager/sdk@v0.0.1
+```
+
 ```go
-import "github.com/yanqin001/repo-manger/sdk"
+import "github.com/yanqin001/repo-manager/sdk"
 
 client, err := sdk.NewClient("http://127.0.0.1:8080", nil)
 if err != nil {

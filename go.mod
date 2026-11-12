@@ -1,4 +1,4 @@
-module github.com/yanqin001/repo-manger
+module github.com/yanqin001/repo-manager
 
 go 1.26.1
 
